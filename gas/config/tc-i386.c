@@ -18663,6 +18663,283 @@ tc_pe_dwarf2_emit_offset (symbolS *symbol, unsigned int size)
 }
 #endif
 
+#if defined (OBJ_ELF) || defined (OBJ_MAYBE_ELF)
+int
+i386_elf_validate_fix_sub (fixS *fixp, segT seg)
+{
+  if (seg == reg_section)
+    return FALSE;
+
+  if (IS_ELF && !object_64bit)
+    return TRUE;
+
+  return fixp->fx_r_type == BFD_RELOC_GPREL32
+    || fixp->fx_r_type == BFD_RELOC_GPREL16;
+}
+
+# ifdef ENABLE_X86_HPA_SEGELF
+/* WHICH is '!' or '&'. */
+static segT
+i386_elf_ensure_segelf_aux_seg (segT seg, char which)
+{
+  const char *name;
+  char *aux_name;
+  size_t name_len;
+  asection *aux_seg;
+  segT save_now_seg;
+  subsegT save_now_subseg;
+  flagword aux_seg_flags;
+
+  if (seg == absolute_section)
+    return seg;
+
+  if (! SEG_NORMAL (seg))
+    return undefined_section;
+
+  if (bfd_is_com_section (seg))
+    seg = bss_section;
+
+  name = segment_name (seg);
+  name_len = strlen (name);
+  if (name_len != 0)
+    {
+      char tail = name[name_len - 1];
+      if (tail == which)
+	return seg;
+      else if (tail == '$' || tail == ('!' ^ '&' ^ which))
+	--name_len;
+    }
+
+  aux_name = xmalloc (name_len + 2);
+  memcpy (aux_name, name, name_len);
+  aux_name[name_len] = which;
+  aux_name[name_len + 1] = 0;
+
+  aux_seg = subseg_get (aux_name, 0);
+  aux_seg_flags = SEC_READONLY;
+  aux_seg_flags |= bfd_section_flags (seg)
+		   & (SEC_ALLOC | SEC_LOAD | SEC_CODE | SEC_DATA | SEC_ROM
+		      | SEC_LINK_ONCE | SEC_LINK_DUPLICATES);
+  bfd_set_section_flags (aux_seg, aux_seg_flags);
+
+  save_now_seg = now_seg;
+  save_now_subseg = now_subseg;
+  subseg_set (aux_seg, 0);
+  subseg_set (save_now_seg, save_now_subseg);
+
+  return aux_seg;
+}
+
+/* WHICH is '!' or '&'. */
+static symbolS *
+i386_elf_find_segelf_aux_symbol (symbolS *symbolP, char which)
+{
+  const char *name = S_GET_NAME (symbolP);
+  size_t name_len = strlen (name);
+  char *ia16_aux_name;
+  symbolS *baseP;
+
+  if (name_len == strlen (GLOBAL_OFFSET_TABLE_NAME)
+      && memcmp (name, GLOBAL_OFFSET_TABLE_NAME, name_len) == 0)
+    return NULL;
+
+  if (name_len != 0)
+    {
+      char tail = name[name_len - 1];
+
+      if (tail == which)
+	return symbolP;
+
+      if (tail == ('!' ^ '&' ^ which))
+	--name_len;
+      /*
+       * Handle the special case where SYMBOLP is a section symbol.  We
+       * cannot rely on section_symbol (.) to work correctly, since GAS
+       * might still be constructing that very symbol at this point.
+       */
+      else if (! S_IS_EXTERNAL (symbolP)
+	       && symbol_get_frag (symbolP) == &zero_address_frag)
+	{
+	  segT seg = S_GET_SEGMENT (symbolP);
+	  if (seg != undefined_section
+	      && strcmp (name, seg->symbol->name) == 0)
+	    {
+	      if (seg == absolute_section)
+		return symbolP;
+	      if (tail == '$')
+		--name_len;
+	    }
+	}
+    }
+
+  ia16_aux_name = xmalloc (name_len + 2);
+  memcpy (ia16_aux_name, name, name_len);
+  ia16_aux_name[name_len] = which;
+  ia16_aux_name[name_len + 1] = 0;
+
+  baseP = symbol_find_or_make (ia16_aux_name);
+
+  /*
+   *	"jobs.s: Internal error in symbol_new at ../../binutils-ia16/gas/
+   *	 symbols.c:228."
+   * If this looks really really like a local symbol, then try to flesh it
+   * out immediately.
+   */
+  if (S_GET_SEGMENT (baseP) == undefined_section
+      && S_IS_LOCAL (symbolP) && bfd_is_local_label_name (stdoutput, name))
+    {
+      segT seg = S_GET_SEGMENT (symbolP);
+      if (seg != undefined_section && seg != reg_section
+	  && seg != expr_section)
+	{
+	  segT aux_seg = i386_elf_ensure_segelf_aux_seg (seg, which);
+	  S_SET_VALUE (baseP, 0);
+	  S_SET_SEGMENT (baseP, aux_seg);
+	  S_CLEAR_EXTERNAL (baseP);
+	  /* FIXME */
+	  symbol_mark_used_in_reloc (baseP);
+	}
+    }
+
+  free (ia16_aux_name);
+
+  return baseP;
+}
+
+void
+i386_elf_symbol_new_hook (symbolS *symbolP)
+{
+  symbolS *auxP;
+  segT seg = NULL;
+
+  if (x86_elf_abi != I386_SEGELF_ABI)
+    return;
+
+  /*
+   * For each symbol `foo' --- unless `foo' is _GLOBAL_OFFSET_TABLE_ ---
+   * create slots in the symbol table for a `foo!' and a `foo&'.  If `foo'
+   * is already defined and known to be in a section `bar' or `bar$', then
+   * also create sections named `bar!' and `bar&'.
+   *
+   * As a special case, if `foo' _is_ the section symbol `bar$', then name
+   * our new symbols `bar!' and `bar&' rather than `bar$!' and `bar$&'.
+   *
+   * And, always create auxiliary sections for our current section.
+   */
+  auxP = i386_elf_find_segelf_aux_symbol (symbolP, '!');
+
+  if (! auxP || auxP == symbolP)
+    return;
+
+  seg = S_GET_SEGMENT (symbolP);
+  i386_elf_ensure_segelf_aux_seg (seg, '!');
+  if (seg != now_seg)
+    i386_elf_ensure_segelf_aux_seg (now_seg, '!');
+
+  /*
+   * FIXME: we do not really need `foo&' if `foo' will be externally
+   * defined.
+   */
+  auxP = i386_elf_find_segelf_aux_symbol (symbolP, '&');
+
+  if (! auxP || auxP == symbolP)
+    return;
+
+  i386_elf_ensure_segelf_aux_seg (seg, '&');
+  if (seg != now_seg)
+    i386_elf_ensure_segelf_aux_seg (now_seg, '&');
+}
+
+int
+i386_elf_frob_symbol (symbolS *symbolP)
+{
+  const char *name;
+  char *thang_name, tail;
+  size_t name_len;
+  symbolS *thangP;
+  segT thang_seg, aux_seg;
+
+  if (x86_elf_abi != I386_SEGELF_ABI)
+    return 0;
+
+  if (S_GET_SEGMENT (symbolP) != undefined_section)
+    return 0;
+
+  name = S_GET_NAME (symbolP);
+  name_len = strlen (name);
+  if (name_len == 0)
+    return 0;
+
+  tail = name[name_len - 1];
+  if (tail != '!' && tail != '&')
+    return 0;
+
+  /*
+   * For each symbol `foo!' or `foo&' which is not already fleshed out, look
+   * up the symbol `foo'.  If `foo' has been referenced, then define `foo!'
+   * and `foo&' appropriately.
+   *
+   * If there is no `foo', then look up `foo$', in case there is a section
+   * symbol by that name.
+   *
+   * Note that `foo!' and `foo&' need to be defined correctly
+   *   * whether `foo' is local, global, or only defined outside
+   *   * whether or not `foo' (or `foo$') is a section symbol
+   *   * whether or not `foo' is defined through `.comm' or `.lcomm'
+   *   * whether or not `foo' is an absolute value
+   *   * whether or not `foo' is weak...
+   */
+  thang_name = xstrdup (name);
+  thang_name[name_len - 1] = 0;
+
+  thangP = symbol_find (thang_name);
+  if (! thangP)
+    {
+      thang_name[name_len - 1] = '$';
+      thangP = symbol_find (thang_name);
+      if (! thangP
+	  || (symbol_get_bfdsym (thangP)->flags & BSF_SECTION_SYM) == 0)
+	{
+	  free (thang_name);
+	  return 0;
+	}
+    }
+  free (thang_name);
+
+  thang_seg = S_GET_SEGMENT (thangP);
+  if (! SEG_NORMAL (thang_seg))
+    {
+      if (S_IS_WEAK (thangP))
+	S_SET_WEAK (symbolP);
+      else if (thang_seg == undefined_section)
+	;
+      else if (S_IS_EXTERNAL (thangP))
+	S_SET_WEAK (symbolP);
+      else
+	{
+	  S_SET_VALUE (symbolP, 0);
+	  S_SET_SEGMENT (symbolP, absolute_section);
+	  S_CLEAR_EXTERNAL (symbolP);
+	}
+    }
+  else
+    {
+      aux_seg = i386_elf_ensure_segelf_aux_seg (thang_seg, tail);
+      S_SET_VALUE (symbolP, 0);
+      S_SET_SEGMENT (symbolP, aux_seg);
+      if (S_IS_WEAK (thangP)
+	  || (thang_seg == bfd_com_section_ptr && S_IS_EXTERNAL (thangP)))
+	S_SET_WEAK (symbolP);
+      else if (S_IS_EXTERNAL (thangP))
+	S_SET_EXTERNAL (symbolP);
+      else
+	S_CLEAR_EXTERNAL (symbolP);
+    }
+  return 0;
+}
+# endif
+#endif
+
 #ifdef OBJ_ELF
 int
 i386_elf_section_type (const char *str, size_t len)

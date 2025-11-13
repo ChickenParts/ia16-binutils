@@ -26,6 +26,15 @@
 /* 386 uses REL relocations instead of RELA.  */
 #define USE_REL	1
 
+static bfd_reloc_status_type bfd_i386_elf_segment16_reloc (bfd *, arelent *,
+							   asymbol *, void *,
+							   asection *, bfd *,
+							   char **);
+static bfd_reloc_status_type bfd_i386_elf_relseg16_reloc (bfd *, arelent *,
+							  asymbol *, void *,
+							  asection *, bfd *,
+							  char **);
+
 static reloc_howto_type elf_howto_table[]=
 {
   HOWTO(R_386_NONE, 0, 0, 0, false, 0, complain_overflow_dont,
@@ -143,7 +152,36 @@ static reloc_howto_type elf_howto_table[]=
 
   /* Another gap.  */
 #define R_386_ext2 (R_386_GOT32X + 1 - R_386_tls_offset)
-#define R_386_vt_offset (R_386_GNU_VTINHERIT - R_386_ext2)
+#define R_386_seg16_offset (R_386_SEG16 - R_386_ext2)
+
+  HOWTO(R_386_SEG16, 4, 2, 16, false, 0, complain_overflow_bitfield,
+	bfd_elf_generic_reloc, "R_386_SEG16",
+	true, 0xffff, 0xffff, false),
+  HOWTO(R_386_SUB16, 0, 2, 16, false, 0, complain_overflow_dont,
+	bfd_elf_generic_reloc, "R_386_SUB16",
+	true, 0xffff, 0xffff, false),
+  HOWTO(R_386_SUB32, 0, 4, 32, false, 0, complain_overflow_bitfield,
+	bfd_elf_generic_reloc, "R_386_SUB32",
+	true, 0xffffffff, 0xffffffff, false),
+  HOWTO(R_386_SEGRELATIVE, 4, 2, 16, false, 0, complain_overflow_bitfield,
+	bfd_elf_generic_reloc, "R_386_SEGRELATIVE",
+	true, 0xffff, 0xffff, false),
+
+  /* Another gap.  */
+#define R_386_ext3 (R_386_SEGRELATIVE + 1 - R_386_seg16_offset)
+#define R_386_ia16_offset (R_386_OZSEG16 - R_386_ext3)
+
+  /* IA16.  */
+  HOWTO(R_386_OZSEG16, 0, 2, 16, false, 0, complain_overflow_dont,
+	bfd_i386_elf_segment16_reloc, "R_386_OZSEG16",
+	true, 0xffff, 0xffff, false),
+  HOWTO(R_386_OZRELSEG16, 0, 2, 16, false, 0, complain_overflow_dont,
+	bfd_i386_elf_relseg16_reloc, "R_386_OZRELSEG16",
+	true, 0xffff, 0xffff, false),
+
+  /* Yet another gap.  */
+#define R_386_ext4 (R_386_OZRELSEG16 + 1 - R_386_ia16_offset)
+#define R_386_vt_offset (R_386_GNU_VTINHERIT - R_386_ext4)
 
 /* GNU extension to record C++ vtable hierarchy.  */
   HOWTO (R_386_GNU_VTINHERIT,	/* type */
@@ -178,6 +216,145 @@ static reloc_howto_type elf_howto_table[]=
 #define R_386_vt (R_386_GNU_VTENTRY + 1 - R_386_vt_offset)
 
 };
+
+/* This function, bfd_i386_elf_segment16_reloc (...), and bfd_i386_elf_
+   relseg16_reloc (...), are intended to support MS-DOS MZ relocations for
+   the 16-bit Intel 8086 (ia16-elf).
+
+   In the newlib-ia16 linker script, IA-16 segments are represented as
+   64-KiB address spaces with overlapping VMAs but distinct LMAs.  So, to
+   compute the paragraph distance of a section's segment (from the program's
+   base), we can subtract the section's VMA from its LMA.
+
+   If the MZ header has its own section, also subtract the LMA for the end
+   of the header.  -- tkchia  */
+static bool
+bfd_i386_elf_get_paragraph_distance (asection *input_section,
+				     bfd_vma *distance)
+{
+  asection *output_section = input_section->output_section, *hdr_sec;
+  bfd *output_bfd;
+  bfd_vma lma, vma, dist;
+
+  if (bfd_is_const_section (input_section) || ! output_section)
+    {
+      /* xgettext:c-format */
+      _bfd_error_handler (_("R_386_OZSEG16 or R_386_OZRELSEG16 for \
+symbol with no output section"));
+      return false;
+    }
+
+  output_bfd = output_section->owner;
+  lma = output_section->lma;
+  vma = output_section->vma;
+  dist = lma / 16 - vma / 16;
+  hdr_sec = bfd_get_section_by_name (output_bfd, ".msdos_mz_hdr");
+
+  if (lma % 16 != vma % 16)
+    {
+      /* xgettext:c-format */
+      _bfd_error_handler (_("%pB: R_386_OZSEG16 or R_386_OZRELSEG16 with \
+unaligned section `%pA'"), output_bfd, output_section);
+      return false;
+    }
+
+  if (! hdr_sec)
+    {
+      *distance = dist;
+      return true;
+    }
+
+  if (hdr_sec->lma % 16 != 0 || hdr_sec->size % 16 != 0)
+    {
+      /* xgettext:c-format */
+      _bfd_error_handler (_("%pB: R_386_OZSEG16 or R_386_OZRELSEG16 with \
+unaligned MZ header"), output_bfd);
+      return false;
+    }
+
+  dist -= hdr_sec->lma / 16 + hdr_sec->size / 16;
+  *distance = dist;
+  return true;
+}
+
+/* Either install or perform an R_386_OZSEG16 relocation.
+
+   This function simply treats R_386_OZSEG16 relocations as if they are
+   R_386_OZRELSEG16 relocations.  It is assumed that the elf_i386_msdos_mz
+   linker emulation code (e.g.) has created the MZ relocation entry (e.g.)
+   needed to properly implement R_386_OZSEG16.  For ELKS a.out output, simply
+   add the relocation to the output section.  This is a bit of a hack.  FIXME.
+								-- tkchia  */
+static bfd_reloc_status_type
+bfd_i386_elf_segment16_reloc (bfd *abfd, arelent *reloc_entry,
+			      asymbol *symbol ATTRIBUTE_UNUSED,
+			      void *data ATTRIBUTE_UNUSED,
+			      asection *input_section, bfd *output_bfd,
+			      char **error_message ATTRIBUTE_UNUSED)
+{
+  return bfd_i386_elf_relseg16_reloc (abfd, reloc_entry, symbol, data,
+				      input_section, output_bfd,
+				      error_message);
+}
+
+/* Either install or perform an R_386_OZRELSEG16 relocation.  */
+static bfd_reloc_status_type
+bfd_i386_elf_relseg16_reloc (bfd *abfd, arelent *reloc_entry, asymbol *symbol,
+			     void *data ATTRIBUTE_UNUSED,
+			     asection *input_section, bfd *output_bfd,
+			     char **error_message ATTRIBUTE_UNUSED)
+{
+  bfd_vma paras;
+
+  if (output_bfd)
+    {
+      reloc_entry->address += input_section->output_offset;
+      return bfd_reloc_ok;
+    }
+
+  if (reloc_entry->address + 2 < (bfd_vma) 2
+      || reloc_entry->address + 2
+	 > bfd_get_section_limit (abfd, input_section))
+    return bfd_reloc_outofrange;
+
+  if (strcmp (input_section->output_section->owner->xvec->name, "elks") == 0)
+    {
+      asection *output_section = input_section->output_section;
+      unsigned reloc_count = output_section->reloc_count;
+      arelent **orelocation, *new_reloc_entry;
+
+      orelocation = bfd_realloc (output_section->orelocation,
+				 (reloc_count + 1) * sizeof (arelent *));
+      if (! orelocation)
+	return bfd_reloc_other;
+
+      output_section->orelocation = orelocation;
+
+      new_reloc_entry = bfd_alloc (abfd, sizeof (arelent));
+      if (! new_reloc_entry)
+	return bfd_reloc_other;
+      *new_reloc_entry = *reloc_entry;
+      new_reloc_entry->address += input_section->output_offset;
+
+      orelocation[reloc_count] = new_reloc_entry;
+      output_section->reloc_count = reloc_count + 1;
+      return bfd_reloc_ok;
+    }
+
+  if ((symbol->flags & BSF_WEAK) != 0
+      && bfd_is_und_section (symbol->section))
+    /* tkchia 20190920 FIXME:
+	 1) If this is a R_386_OZSEG16 relocation, we will get a spurious
+	    MZ relocation, which should really be suppressed.
+	 2) We should really also fix the ELF linker side of things to
+	    properly handle IA-16 relocations on weak symbols.  -- tkchia  */
+    paras = 0;
+  else if (! bfd_i386_elf_get_paragraph_distance (symbol->section, &paras))
+    return bfd_reloc_other;
+
+  return _bfd_relocate_contents (&elf_howto_table[R_386_16 - R_386_ext_offset],
+    abfd, paras, (bfd_byte *) data + reloc_entry->address);
+}
 
 #ifdef DEBUG_GEN_RELOC
 #define TRACE(str) \
@@ -330,6 +507,30 @@ elf_i386_reloc_type_lookup (bfd *abfd,
       TRACE ("BFD_RELOC_386_GOT32X");
       return &elf_howto_table[R_386_GOT32X - R_386_tls_offset];
 
+    case BFD_RELOC_386_SEG16:
+      TRACE ("BFD_RELOC_386_SEG16");
+      return &elf_howto_table[R_386_SEG16 - R_386_seg16_offset];
+
+    case BFD_RELOC_386_SUB16:
+      TRACE ("BFD_RELOC_386_SUB16");
+      return &elf_howto_table[R_386_SUB16 - R_386_seg16_offset];
+
+    case BFD_RELOC_386_SUB32:
+      TRACE ("BFD_RELOC_386_SUB32");
+      return &elf_howto_table[R_386_SUB32 - R_386_seg16_offset];
+
+    case BFD_RELOC_386_SEGRELATIVE:
+      TRACE ("BFD_RELOC_386_SEGRELATIVE");
+      return &elf_howto_table[R_386_SEGRELATIVE - R_386_seg16_offset];
+
+    case BFD_RELOC_386_OZSEG16:
+      TRACE ("BFD_RELOC_386_OZSEG16");
+      return &elf_howto_table[R_386_OZSEG16 - R_386_ia16_offset];
+
+    case BFD_RELOC_386_OZRELSEG16:
+      TRACE ("BFD_RELOC_386_OZRELSEG16");
+      return &elf_howto_table[R_386_OZRELSEG16 - R_386_ia16_offset];
+
     case BFD_RELOC_VTABLE_INHERIT:
       TRACE ("BFD_RELOC_VTABLE_INHERIT");
       return &elf_howto_table[R_386_GNU_VTINHERIT - R_386_vt_offset];
@@ -372,8 +573,12 @@ elf_i386_rtype_to_howto (unsigned r_type)
 	  >= R_386_ext - R_386_standard)
       && ((indx = r_type - R_386_tls_offset) - R_386_ext
 	  >= R_386_ext2 - R_386_ext)
-      && ((indx = r_type - R_386_vt_offset) - R_386_ext2
-	  >= R_386_vt - R_386_ext2))
+      && ((indx = r_type - R_386_seg16_offset ) - R_386_ext2
+	  >= R_386_ext3 - R_386_ext2)
+      && ((indx = r_type - R_386_ia16_offset) - R_386_ext3
+	  >= R_386_ext4 - R_386_ext3)
+      && ((indx = r_type - R_386_vt_offset) - R_386_ext4
+	  >= R_386_vt - R_386_ext4))
       return NULL;
   /* PR 17512: file: 0f67f69d.  */
   if (elf_howto_table [indx].type != r_type)
@@ -1841,6 +2046,7 @@ elf_i386_scan_relocs (bfd *abfd,
 
 	case R_386_32:
 	case R_386_PC32:
+	case R_386_SEG16:
 	  if (eh != NULL && (sec->flags & SEC_CODE) != 0)
 	    eh->zero_undefweak |= 0x2;
 	do_relocation:
@@ -2000,6 +2206,24 @@ elf_i386_scan_relocs (bfd *abfd,
 	case R_386_GNU_VTENTRY:
 	  if (!bfd_elf_gc_record_vtentry (abfd, sec, h, rel->r_offset))
 	    goto error_return;
+	  break;
+
+	case R_386_SUB16:
+	case R_386_SUB32:
+	  if (bfd_link_dll (info))
+	    {
+	      reloc_howto_type *howto
+		= elf_i386_rtype_to_howto (r_type);
+	      if (h)
+		name = h->root.root.string;
+	      else
+		name = bfd_elf_sym_name (abfd, symtab_hdr, isym, NULL);
+	      info->callbacks->einfo
+		(_("%F%P: %pB: unsupported relocation %s against symbol "
+		   "`%s' for shared object\n"),
+		 abfd, howto->name, name);
+	      return false;
+	    }
 	  break;
 
 	default:
@@ -2827,6 +3051,16 @@ elf_i386_relocate_section (bfd *output_bfd,
 	  unresolved_reloc = false;
 	  break;
 
+	case R_386_OZSEG16:	/* see bfd_i386_elf_segment16_reloc above */
+	case R_386_OZRELSEG16:
+	  if (! bfd_i386_elf_get_paragraph_distance (sec, &relocation))
+	    {
+	      bfd_set_error (bfd_error_bad_value);
+	      return false;
+	    }
+	  unresolved_reloc = false;
+	  break;
+
 	case R_386_SIZE32:
 	  /* Set to symbol size.  */
 	  relocation = st_size;
@@ -2834,6 +3068,7 @@ elf_i386_relocate_section (bfd *output_bfd,
 
 	case R_386_32:
 	case R_386_PC32:
+	case R_386_SEG16:
 	  if ((input_section->flags & SEC_ALLOC) == 0
 	      || is_vxworks_tls)
 	    break;
@@ -3544,6 +3779,15 @@ elf_i386_relocate_section (bfd *output_bfd,
 	    relocation = elf_i386_tpoff (info, relocation);
 	  else
 	    relocation = -elf_i386_tpoff (info, relocation);
+	  break;
+
+	/* NB: Multiple relocations for the same offset are handled
+	   automatically since i386 uses REL, not RELA relocation.
+	   The previous relocation result becomes the addend for the
+	   current relocation.  */
+	case R_386_SUB16:
+	case R_386_SUB32:
+	  relocation = -relocation;
 	  break;
 
 	default:

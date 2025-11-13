@@ -430,6 +430,17 @@ extern bfd_vma x86_64_section_letter (int, const char **);
 extern void x86_cleanup (void);
 #define md_cleanup() x86_cleanup ()
 
+extern int i386_elf_validate_fix_sub (struct fix *, segT);
+#define TC_VALIDATE_FIX_SUB i386_elf_validate_fix_sub
+
+#ifdef ENABLE_X86_HPA_SEGELF
+extern void i386_elf_symbol_new_hook (symbolS *);
+#define tc_symbol_new_hook i386_elf_symbol_new_hook
+
+extern int i386_elf_frob_symbol (symbolS *);
+#define tc_frob_symbol(symbolP, punt) ((punt) = i386_elf_frob_symbol (symbolP))
+#endif
+
 #define TARGET_USE_GINSN 1
 /* Allow GAS to synthesize DWARF CFI for hand-written asm.
    PS: TARGET_USE_CFIPOP is a pre-condition.  */
