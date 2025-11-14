@@ -226,6 +226,13 @@ struct internal_exec
   unsigned char a_dalign;	/* Alignment of data segment.  */
   unsigned char a_balign;	/* Alignment of bss segment.  */
   char a_relaxable;		/* Enough info for linker relax.  */
+  /* Added mainly for ELKS; might be useful for PDP-11  -- tkchia 20200506 */
+#define NOVL 15
+  bfd_vma ov_siz[NOVL];		/* Overlay sizes. */
+  /* Added for ELKS  -- tkchia 20200521 */
+  bfd_vma a_heap;		/* Maximum heap size (info == 1) or total
+				   data segment memory (info == 0). */
+  bfd_vma a_minstack;		/* Minimum initial stack size. */
 };
 
 /* Magic number is written
@@ -412,6 +419,9 @@ struct aoutdata
      table, used when linking on SunOS.  This is indexed by the symbol
      index.  */
   bfd_vma *local_got_offsets;
+
+  /* Overlay sections for ELKS -- tkchia 20200505 */
+  asection *ovsec[NOVL];
 };
 
 struct  aout_data_struct
@@ -426,6 +436,7 @@ struct  aout_data_struct
 #define	obj_textsec(bfd)		   (adata (bfd).textsec)
 #define	obj_datasec(bfd)		   (adata (bfd).datasec)
 #define	obj_bsssec(bfd)			   (adata (bfd).bsssec)
+#define obj_ovsec(bfd, i)		   (adata (bfd).ovsec[i])
 #define	obj_sym_filepos(bfd)		   (adata (bfd).sym_filepos)
 #define	obj_str_filepos(bfd)		   (adata (bfd).str_filepos)
 #define	obj_reloc_entry_size(bfd)	   (adata (bfd).reloc_entry_size)
@@ -654,5 +665,8 @@ extern bool NAME (aout, bfd_free_cached_info)
 		     obj_textsec (abfd)->size)				\
    && ((sec)->vma + (sec)->size) <= obj_datasec (abfd)->vma		\
    && ((abfd)->flags & D_PAGED) != 0)
+
+/* ELKS-specific function for setting heap and stack parameters.  */
+extern void elks_set_heap_and_minstack (bfd *, bfd_vma, bfd_vma, bfd_vma, bfd_vma);
 
 #endif /* ! defined (LIBAOUT_H) */
